@@ -13,7 +13,7 @@ approvers:
 api-approvers:
   - "@JoelSpeed"
 creation-date: 2026-08-19
-last-updated: 2026-08-19
+last-updated: 2026-08-31
 tracking-link:
   - "https://issues.redhat.com/browse/CNTRLPLANE-3527"
 status: provisional
@@ -576,6 +576,68 @@ type NodePortServiceConfig struct {
    platform infrastructure, not user-configurable, and
    orthogonal to the publishing preset.
 
+#### Why private connectivity is not a publishing preset
+
+A dedicated "PrivateLink" preset — covering AWS, Azure, and
+GCP `PublicAndPrivate` and `Private` — is a plausible
+alternative, on the premise that these always use a single
+internal router and require a hostname for APIServer and
+OAuth. That premise holds for GCP and Azure private
+clusters: Private Service Connect (GCP) and Private Link
+Service (Azure) expose only a single private endpoint (the
+router), so KAS and OAuth must use Route (hostname
+required). This constraint is captured by the
+`GCP Private → DedicatedIngress only` and
+`Azure Private → DedicatedIngress only` CEL rules below.
+
+Private connectivity is nonetheless kept orthogonal to the
+publishing preset (derived from
+`spec.platform.<cloud>.endpointAccess`) rather than being
+reified as a preset, for three reasons:
+
+1. **AWS breaks the generalization.** AWS PrivateLink can
+   create two VPC Endpoint Services (`kube-apiserver-private`
+   and `private-router`), so AWS `Private` /
+   `PublicAndPrivate` supports *both* KAS on Route
+   (`DedicatedIngress`) *and* a dedicated private KAS
+   LoadBalancer (`DedicatedAPIEndpoint`). A single
+   `PrivateLink` preset could not represent both AWS
+   variants without re-introducing the Route-vs-LB
+   discriminator that `DedicatedIngress` /
+   `DedicatedAPIEndpoint` already provide — or it would
+   drop AWS's supported dedicated-private-KAS capability.
+
+2. **The publishing intent is identical across public and
+   private.** For `Public + ExternalDNS`,
+   `PublicAndPrivate + ExternalDNS`, and
+   `Private + ExternalDNS`, all four services use Route
+   through one router — the same `DedicatedIngress` intent.
+   Everything private-specific (the internal LoadBalancer
+   Service, the PrivateLink/PSC/PLS endpoint, route
+   labeling) is derived from `endpointAccess` by the
+   controllers (`IsPrivateHCP`, `LabelHCPRoutes`), not from
+   the publishing config. A `PrivateLink` preset would
+   re-encode reachability that `endpointAccess` already
+   owns, allowing contradictory specs (e.g. `PrivateLink`
+   with `endpointAccess: Public`) that would then need
+   still more CEL to forbid.
+
+3. **"Single internal router" is precise only for
+   `Private`.** The HCP router is a single Deployment, but
+   for `PublicAndPrivate` it is fronted by *two*
+   LoadBalancer Services — an external one
+   (`IsPublicHCP && LabelHCPRoutes`) and an internal one
+   (`IsPrivateHCP`). Naming a preset for one reachability
+   mode would mislead for the very common dual-reachability
+   case.
+
+Net: the "PrivateLink" topology is `DedicatedIngress`
+combined with `endpointAccess` of `Private` or
+`PublicAndPrivate`. It has a clearly named home without a
+redundant API discriminator, and the GCP/Azure
+single-endpoint constraint is enforced by cross-field CEL
+rather than as a third enum value.
+
 #### Preset-to-topology mapping
 
 | Preset | KAS | OAuth | Konnectivity | Ignition | Ingress infrastructure | Platforms |
@@ -583,10 +645,18 @@ type NodePortServiceConfig struct {
 | `DedicatedIngress` (LB) | Route | Route | Route | Route | HCP Router + cloud LB | AWS+ExtDNS, AWS Private+ExtDNS, Azure (all), GCP+ExtDNS, KubeVirt+ExtDNS, PowerVS+ExtDNS |
 | `DedicatedIngress` (LB) + `oauthEndpoint` | Route | **LB** | Route | Route | HCP Router + cloud LB; OAuth on dedicated LB | Azure self-managed + ExtDNS |
 | `DedicatedIngress` (NodePort) | Route | Route | Route | Route | HCP Router as NodePort | Bare metal use case |
-| `DedicatedIngress` (External) | Route | Route | Route | opt | Platform handles routing | IBMCloud |
+| `DedicatedIngress` (External) | Route | Route | Route | opt | Platform handles routing | IBMCloud (Route path) |
 | `DedicatedAPIEndpoint` | LB | Route | Route | Route | KAS on dedicated LB; rest through mgmt ingress; no HCP router | AWS (no ExtDNS, all endpoint access modes), GCP PublicAndPrivate (no ExtDNS), KubeVirt Ingress, Agent production, OpenStack, PowerVS, None (LB) |
 | `DedicatedAPIEndpoint` + `oAuthServer` | LB | **LB** | Route | Route | KAS+OAuth on dedicated LBs | Azure self-managed (no ExtDNS) |
-| `NodePort` | NP | NP | NP | NP | None | Agent default, KubeVirt NP, None |
+| `NodePort` | NP | NP | NP | NP | None | Agent default, KubeVirt NP, None, IBMCloud (legacy) |
+
+Endpoint access (`Public` / `PublicAndPrivate` / `Private`)
+is an orthogonal axis, not a preset — see "Why private
+connectivity is not a publishing preset". The "PrivateLink"
+topology is `DedicatedIngress` with `endpointAccess` of
+`Private` or `PublicAndPrivate` on AWS, Azure, and GCP;
+`DedicatedAPIEndpoint` is additionally valid for AWS
+private clusters (two VPC Endpoint Services).
 
 ### Topology Considerations
 
@@ -668,7 +738,7 @@ except IBMCloud (which uses `exposure: External`).
 | GCP (Managed) | Private + ExternalDNS | HCP Router + Internal LB (PSC) |
 | KubeVirt | Ingress + ExternalDNS | HCP Router + External LB |
 | PowerVS | With ExternalDNS | HCP Router + External LB |
-| IBMCloud | All | External (no HCP router) |
+| IBMCloud | Route (new) | External (no HCP router) |
 
 **Topology 2: Dedicated API Endpoint
 (KAS=LoadBalancer, rest=Route)**
@@ -692,6 +762,7 @@ except IBMCloud (which uses `exposure: External`).
 | Agent | Default |
 | KubeVirt | NodePort mode |
 | None | With `--api-server-address` |
+| IBMCloud | Legacy clusters (pre-Route migration) |
 
 #### Azure self-managed OAuth LoadBalancer variant
 
@@ -739,7 +810,11 @@ time.
 > enforced. Adding (2) would require relaxation if another
 > platform adopts External later.
 - `NodePort` requires directly reachable management cluster
-  nodes. Only supported on Agent, KubeVirt, and None.
+  nodes. Supported on Agent, KubeVirt, and None. IBMCloud
+  is a managed exception: legacy IBMCloud clusters expose
+  services as NodePort but reach them through IBM's shared
+  ingress rather than directly (see "IBMCloud special
+  cases").
 - `oauthEndpoint: LoadBalancer` is Azure self-managed only.
 
 **Platform validation matrix:**
@@ -788,6 +863,14 @@ time.
 | No | `DedicatedAPIEndpoint` |
 | N/A (NP mode) | `NodePort` |
 
+> **IBM Z (s390x):** "Z" is a worker-node architecture, not
+> a platform. It is supported only on the KubeVirt platform
+> (enforced by CEL:
+> `self.arch != 's390x' || has(self.platform.kubevirt)` in
+> `nodepool_types.go`), so a "Z" cluster inherits the
+> KubeVirt publishing options above and needs no separate
+> preset.
+
 **Agent:**
 
 | Configuration | Valid presets |
@@ -815,11 +898,19 @@ time.
 | Yes | `DedicatedIngress` (LB) |
 | No | `DedicatedAPIEndpoint` |
 
-**IBMCloud:**
+Verified against `hcp create cluster powervs` defaults:
+without ExternalDNS, KAS=LoadBalancer with the rest on
+Route (`DedicatedAPIEndpoint`); with ExternalDNS, all
+services on Route (`DedicatedIngress` LB). The PowerVS CLI
+only supports `Public` (its `isPrivate` is hardcoded
+false), so no private-only row is needed.
+
+**IBMCloud:** (managed only)
 
 | Configuration | Valid presets |
 |--------------|--------------|
-| All (managed only) | `DedicatedIngress` (External) |
+| Route strategy (new) | `DedicatedIngress` (External) |
+| NodePort strategy (legacy, mid-migration) | `NodePort` |
 
 #### CEL validation rules
 
@@ -878,9 +969,13 @@ rule: !has(self.publishing)
       || self.platform.type != "OpenStack"
       || self.publishing.type == "DedicatedAPIEndpoint"
 
-// IBMCloud: DedicatedIngress with External only
+// IBMCloud: DedicatedIngress (External) for new
+// Route-based clusters, or NodePort for legacy clusters
+// still mid-migration (OCPBUGS-57450). See "IBMCloud
+// special cases".
 rule: !has(self.publishing)
       || self.platform.type != "IBMCloud"
+      || self.publishing.type == "NodePort"
       || (self.publishing.type == "DedicatedIngress"
           && has(self.publishing.dedicatedIngress)
           && self.publishing.dedicatedIngress.exposure
@@ -990,12 +1085,31 @@ HO's translation must produce valid presets.
 
 IBMCloud is a managed-only platform (no CLI, created
 exclusively by OCM) with additional special cases:
-- Only 3 required services (no Ignition)
-- Services are mutable — CEL immutability exception
-- KAS uses port 2040 instead of 6443
+- Only 3 required services (no Ignition).
+- Services are mutable — CEL immutability exception.
+- KAS uses internal service port 2040 instead of 6443
+  (`KASSVCIBMCloudPort`). With the Route strategy the
+  externally advertised KAS port is 443, served through
+  IBM's shared ingress, not an HCP router.
+- No HCP router is ever deployed — `UseHCPRouter` and
+  `LabelHCPRoutes` both return false for IBMCloud; IBM's
+  platform handles service exposure.
 
-These are covered by the `DedicatedIngress` preset with
-`exposure: External`.
+IBMCloud is migrating its service publishing from NodePort
+to Route (OCPBUGS-57450), so both must be representable:
+- **Legacy / existing clusters:** all services use
+  `NodePort` (see the example manifests under
+  `docs/content/reference/manifests/ibmcloud/`). These map
+  to the `NodePort` preset.
+- **New / migrated clusters:** services use `Route`, with
+  IBM's platform handling exposure. These map to the
+  `DedicatedIngress` preset with `exposure: External`.
+
+Because IBMCloud services are mutable and clusters may sit
+on either side of this migration, the IBMCloud CEL rule
+must permit **both** the `NodePort` preset and
+`DedicatedIngress` (External) — reflected in the platform
+validation matrix and CEL rules above.
 
 ### Risks and Mitigations
 
@@ -1066,6 +1180,16 @@ router deployment.
 API**: Rejected because it blocks full deprecation of
 `spec.services[]`.
 
+**Make private connectivity ("PrivateLink") its own
+preset**: Rejected because private connectivity is a
+reachability concern already owned by
+`spec.platform.<cloud>.endpointAccess`, not a publishing
+topology — a preset would duplicate that state and permit
+contradictory specs. AWS also supports two private
+topologies (`DedicatedIngress` and `DedicatedAPIEndpoint`)
+that a single preset could not represent. See "Why private
+connectivity is not a publishing preset".
+
 ## Open Questions
 
 1. **Mutability.** Today `spec.services[]` is immutable
@@ -1086,6 +1210,27 @@ API**: Rejected because it blocks full deprecation of
    can use this exposure type. Is `exposure: NodePort`
    valid on all platforms that support `DedicatedIngress`,
    or only a subset (e.g., Agent, KubeVirt, None)?
+
+3. **GCP CLI vs. CEL for `Private` without ExternalDNS.**
+   The proposed `GCP Private → DedicatedIngress only` rule
+   requires KAS to use Route. But the GCP CLI hardcodes
+   `isPrivate=false` (`cmd/cluster/gcp/create.go`), so
+   `GCP Private` without ExternalDNS currently yields
+   KAS=`LoadBalancer` (`DedicatedAPIEndpoint`), which the
+   rule would reject. Before shipping, reconcile the two:
+   either the GCP CLI must set KAS=Route for `Private`
+   (matching Azure, which wires `isPrivate` through), or the
+   matrix/CEL must accept the current CLI output. The GCP
+   validation matrix above omits `Private` without
+   ExternalDNS pending this decision.
+
+4. **OAuth dedicated LB under Azure `Private`.** Azure
+   self-managed can create a second private endpoint for
+   OAuth when OAuth uses `LoadBalancer` (never for KAS), so
+   the `oauthEndpoint` / `oAuthServer` LB variants should be
+   permitted under Azure `Private`, not only `Public` /
+   `PublicAndPrivate`. The CEL for these fields must not
+   restrict them to public endpoint access.
 
 ## Test Plan
 
